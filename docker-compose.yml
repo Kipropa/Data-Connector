@@ -1,0 +1,175 @@
+services:
+  # ── Frontend ──────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8000/api
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    depends_on:
+      - backend
+    networks:
+      - dataconnect
+
+  # ── Backend ────────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - DEBUG=1
+      - SECRET_KEY=dev-secret-key-change-in-prod
+      - DATABASE_URL=postgresql://dc_user:dc_pass@postgres:5432/dataconnect
+      - REDIS_URL=redis://redis:6379/0
+      - MEDIA_ROOT=/app/media
+      - ALLOWED_HOSTS=localhost,127.0.0.1,backend
+      # ClickHouse connection settings
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=9000
+      - CLICKHOUSE_USER=ch_user
+      - CLICKHOUSE_PASSWORD=ch_pass
+      - CLICKHOUSE_DATABASE=warehouse_db
+    volumes:
+      - ./backend:/app
+      - media_files:/app/media
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      clickhouse:
+        condition: service_healthy      # ← Important
+    networks:
+      - dataconnect
+
+  # ── Celery Worker ──────────────────────────────────────────────────────────
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    entrypoint: ["/bin/sh", "/app/entrypoint-celery.sh"]
+    environment:
+      - DEBUG=1
+      - SECRET_KEY=dev-secret-key-change-in-prod
+      - DATABASE_URL=postgresql://dc_user:dc_pass@postgres:5432/dataconnect
+      - REDIS_URL=redis://redis:6379/0
+      - MEDIA_ROOT=/app/media
+      - CLICKHOUSE_HOST=clickhouse
+      - CLICKHOUSE_PORT=9000
+      - CLICKHOUSE_USER=ch_user
+      - CLICKHOUSE_PASSWORD=ch_pass
+      - CLICKHOUSE_DATABASE=warehouse_db
+    volumes:
+      - ./backend:/app
+      - media_files:/app/media
+    depends_on:
+      - backend
+      - redis
+      - clickhouse
+    networks:
+      - dataconnect
+
+  # ── PostgreSQL ────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: dc_user
+      POSTGRES_PASSWORD: dc_pass
+      POSTGRES_DB: dataconnect
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./docker/init-postgres.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dc_user -d dataconnect"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dataconnect
+
+  # ── MySQL, MongoDB (unchanged) ────────────────────────────────────────────
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root_pass
+      MYSQL_DATABASE: sales_db
+      MYSQL_USER: mysql_user
+      MYSQL_PASSWORD: mysql_pass
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/init-mysql.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "3306:3306"
+    networks:
+      - dataconnect
+
+  mongo:
+    image: mongo:7.0
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: mongo_user
+      MONGO_INITDB_ROOT_PASSWORD: mongo_pass
+      MONGO_INITDB_DATABASE: events_db
+    volumes:
+      - mongo_data:/data/db
+      - ./docker/init-mongo.js:/docker-entrypoint-initdb.d/init.js
+    ports:
+      - "27017:27017"
+    networks:
+      - dataconnect
+
+  # ── ClickHouse (FIXED) ────────────────────────────────────────────────────
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.1
+    container_name: clickhouse
+    environment:
+      CLICKHOUSE_DB: warehouse_db
+      CLICKHOUSE_USER: ch_user
+      CLICKHOUSE_PASSWORD: ch_pass
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1     # ← Critical
+    volumes:
+      - ch_data:/var/lib/clickhouse
+      - ./docker/init-clickhouse.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "9000:9000"
+      - "8123:8123"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query=SELECT 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - dataconnect
+
+  # ── Redis ─────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - dataconnect
+
+volumes:
+  pg_data:
+  mysql_data:
+  mongo_data:
+  ch_data:
+  media_files:
+
+networks:
+  dataconnect:
+    driver: bridge
