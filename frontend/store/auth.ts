@@ -23,6 +23,10 @@ export const useAuthStore = create<AuthState>()(
       setAuth: (user, token) => set({ user, token }),
       logout: () => set({ user: null, token: null }),
     }),
-    { name: "dc-auth" }
+    {
+      name: "dc-auth",
+      // Only persist user and token — nothing else
+      partialize: (state) => ({ user: state.user, token: state.token }),
+    }
   )
 );

@@ -18,8 +18,14 @@ class ConnectionSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "last_tested_at", "last_test_ok", "created_at", "updated_at"]
 
     def create(self, validated_data):
+        from django.db import IntegrityError
         validated_data["owner"] = self.context["request"].user
-        return super().create(validated_data)
+        try:
+            return super().create(validated_data)
+        except IntegrityError:
+            raise serializers.ValidationError(
+                {"name": "A connection with this name already exists. Please choose a different name."}
+            )
 
 
 class BatchJobSerializer(serializers.ModelSerializer):

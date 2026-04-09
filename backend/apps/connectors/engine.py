@@ -1,296 +1,391 @@
 """
-Connector abstraction layer.
+DataConnect Connector Engine
+============================
 
-Each DB type implements BaseConnector with:
-  - test_connection()  → bool
-  - list_tables()      → list[str]
-  - extract_batch()    → list[dict], total_count
+Architecture
+------------
+Every database connector is a subclass of BaseConnector implementing three
+abstract methods:
 
-Adding a new connector: subclass BaseConnector, register in REGISTRY.
+    test_connection() -> bool
+    list_tables()     -> list[str]
+    extract_batch(query, batch_size, offset) -> (rows, total)
+
+Connectors are registered in the REGISTRY dict:
+
+    REGISTRY["my_db"] = MyDBConnector
+
+That is the ONLY change needed to add a new database type. The rest of the
+platform (API, batch jobs, UI dropdowns) picks it up automatically.
+
+Built-in connectors
+-------------------
+  postgresql  →  PostgreSQLConnector
+  mysql       →  MySQLConnector
+  mongodb     →  MongoDBConnector
+  clickhouse  →  ClickHouseConnector
+
+Adding a new connector (example: SQLite)
+-----------------------------------------
+  1. Create  apps/connectors/contrib/sqlite_connector.py
+  2. Subclass BaseConnector and implement the 3 abstract methods
+  3. In that file's bottom:  from apps.connectors.engine import REGISTRY
+                              REGISTRY["sqlite"] = SQLiteConnector
+  4. Import the module in apps/connectors/apps.py  ready() method so it
+     auto-registers on startup — or just import it here directly.
+
+That's it. No migrations, no settings changes needed.
 """
 from __future__ import annotations
 
 import abc
+import importlib
 import logging
+import os
+import pkgutil
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
+# ── Exceptions ─────────────────────────────────────────────────────────────
 class ConnectorError(Exception):
     """Raised when a connector operation fails."""
 
 
+class ConnectorNotFound(ConnectorError):
+    """Raised when no connector is registered for a db_type."""
+
+
+# ── Base class ─────────────────────────────────────────────────────────────
 class BaseConnector(abc.ABC):
-    """Abstract base for all database connectors."""
+    """
+    Abstract base for all database connectors.
+
+    Subclass this, implement the three abstract methods, then register:
+        REGISTRY["your_db_type"] = YourConnector
+    """
+
+    #: Human-readable display name shown in the UI
+    display_name: str = ""
+
+    #: Default port for this database type
+    default_port: int = 0
 
     def __init__(self, config: dict):
         self.config = config
 
-    @abc.abstractmethod
-    def test_connection(self) -> bool: ...
+    # ── Required interface ─────────────────────────────────────────────────
 
     @abc.abstractmethod
-    def list_tables(self) -> list[str]: ...
-
-    @abc.abstractmethod
-    def extract_batch(
-        self, query: str, batch_size: int = 100, offset: int = 0
-    ) -> tuple[list[dict], int]:
-        """Return (rows, total_count)."""
+    def test_connection(self) -> bool:
+        """Return True if the connection is reachable, False otherwise."""
         ...
 
-    def close(self):
-        pass
-
-
-# ── PostgreSQL ─────────────────────────────────────────────────────────────
-class PostgreSQLConnector(BaseConnector):
-    def _conn(self):
-        import psycopg2
-        import psycopg2.extras
-
-        cfg = self.config
-        return psycopg2.connect(
-            host=cfg["host"],
-            port=cfg.get("port", 5432),
-            dbname=cfg["database"],
-            user=cfg["username"],
-            password=cfg.get("password", ""),
-            connect_timeout=10,
-        )
-
-    def test_connection(self) -> bool:
-        try:
-            conn = self._conn()
-            conn.close()
-            return True
-        except Exception as e:
-            logger.warning("PG test failed: %s", e)
-            return False
-
+    @abc.abstractmethod
     def list_tables(self) -> list[str]:
-        import psycopg2.extras
+        """Return a list of table/collection names in the database."""
+        ...
 
-        conn = self._conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT table_schema || '.' || table_name
-                    FROM information_schema.tables
-                    WHERE table_schema NOT IN ('pg_catalog','information_schema')
-                    ORDER BY 1
-                    """
-                )
-                return [row[0] for row in cur.fetchall()]
-        finally:
-            conn.close()
-
+    @abc.abstractmethod
     def extract_batch(
         self, query: str, batch_size: int = 100, offset: int = 0
     ) -> tuple[list[dict], int]:
-        import psycopg2.extras
+        """
+        Execute query and return (rows, total_count).
 
-        conn = None
-        try:
-            conn = self._conn()
-            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                # Count total
-                count_sql = f"SELECT COUNT(*) FROM ({query}) AS _q"
-                cur.execute(count_sql)
-                total = cur.fetchone()["count"]
-                # Paginated extract
-                cur.execute(f"{query} LIMIT %s OFFSET %s", (batch_size, offset))
-                rows = [dict(r) for r in cur.fetchall()]
-                return rows, total
-        except Exception as e:
-            raise ConnectorError(f"PostgreSQL extract failed: {e}") from e
-        finally:
-            if conn:
-                conn.close()
+        rows        — list of dicts, one per row
+        total_count — total rows in the full result set (for pagination)
+        """
+        ...
 
+    # ── Optional hooks ─────────────────────────────────────────────────────
 
-# ── MySQL ─────────────────────────────────────────────────────────────────
-class MySQLConnector(BaseConnector):
-    def _conn(self):
-        import MySQLdb
+    def close(self) -> None:
+        """Called after extraction is complete. Override to release resources."""
 
-        cfg = self.config
-        return MySQLdb.connect(
-            host=cfg["host"],
-            port=cfg.get("port", 3306),
-            db=cfg["database"],
-            user=cfg["username"],
-            passwd=cfg.get("password", ""),
-            connect_timeout=10,
-            charset="utf8mb4",
-        )
-
-    def test_connection(self) -> bool:
-        try:
-            conn = self._conn()
-            conn.close()
-            return True
-        except Exception as e:
-            logger.warning("MySQL test failed: %s", e)
-            return False
-
-    def list_tables(self) -> list[str]:
-        conn = self._conn()
-        try:
-            cur = conn.cursor()
-            cur.execute("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'")
-            return [row[0] for row in cur.fetchall()]
-        finally:
-            conn.close()
-
-    def extract_batch(
-        self, query: str, batch_size: int = 100, offset: int = 0
-    ) -> tuple[list[dict], int]:
-        import MySQLdb.cursors
-
-        conn = None
-        try:
-            conn = self._conn()
-            cur = conn.cursor(MySQLdb.cursors.DictCursor)
-            cur.execute(f"SELECT COUNT(*) AS cnt FROM ({query}) AS _q")
-            total = cur.fetchone()["cnt"]
-            cur.execute(f"{query} LIMIT %s OFFSET %s", (batch_size, offset))
-            rows = list(cur.fetchall())
-            return rows, total
-        except Exception as e:
-            raise ConnectorError(f"MySQL extract failed: {e}") from e
-        finally:
-            if conn:
-                conn.close()
+    @classmethod
+    def get_meta(cls) -> dict:
+        """Return metadata about this connector (used by the API/UI)."""
+        return {
+            "display_name": cls.display_name or cls.__name__.replace("Connector", ""),
+            "default_port": cls.default_port,
+        }
 
 
-# ── MongoDB ───────────────────────────────────────────────────────────────
-class MongoDBConnector(BaseConnector):
-    def _client(self):
-        from pymongo import MongoClient
-
-        cfg = self.config
-        uri = f"mongodb://{cfg['username']}:{cfg['password']}@{cfg['host']}:{cfg.get('port',27017)}/{cfg['database']}?authSource=admin"
-        return MongoClient(uri, serverSelectionTimeoutMS=5000)
-
-    def test_connection(self) -> bool:
-        try:
-            client = self._client()
-            client.server_info()
-            client.close()
-            return True
-        except Exception as e:
-            logger.warning("Mongo test failed: %s", e)
-            return False
-
-    def list_tables(self) -> list[str]:
-        client = self._client()
-        try:
-            db = client[self.config["database"]]
-            return db.list_collection_names()
-        finally:
-            client.close()
-
-    def extract_batch(
-        self, query: str, batch_size: int = 100, offset: int = 0
-    ) -> tuple[list[dict], int]:
-        """query is expected to be a collection name for MongoDB."""
-        import json
-
-        client = None
-        try:
-            client = self._client()
-            db = client[self.config["database"]]
-            # query can be "collection_name" or JSON {"collection":"..","filter":{}}
-            try:
-                params = json.loads(query)
-                collection_name = params.get("collection", query)
-                filter_doc = params.get("filter", {})
-            except (json.JSONDecodeError, TypeError):
-                collection_name = query.strip()
-                filter_doc = {}
-
-            col = db[collection_name]
-            total = col.count_documents(filter_doc)
-            cursor = col.find(filter_doc, {"_id": 0}).skip(offset).limit(batch_size)
-            rows = list(cursor)
-            return rows, total
-        except Exception as e:
-            raise ConnectorError(f"MongoDB extract failed: {e}") from e
-        finally:
-            if client:
-                client.close()
+# ── Registry ───────────────────────────────────────────────────────────────
+REGISTRY: dict[str, type[BaseConnector]] = {}
 
 
-# ── ClickHouse ────────────────────────────────────────────────────────────
-class ClickHouseConnector(BaseConnector):
-    def _client(self):
-        from clickhouse_driver import Client
+def register(db_type: str, connector_cls: type[BaseConnector]) -> None:
+    """
+    Register a connector class for a db_type key.
 
-        cfg = self.config
-        return Client(
-            host=cfg["host"],
-            port=cfg.get("port", 9000),
-            database=cfg["database"],
-            user=cfg["username"],
-            password=cfg.get("password", ""),
-            connect_timeout=10,
-        )
+    Can be used as a decorator or called directly:
 
-    def test_connection(self) -> bool:
-        try:
-            client = self._client()
-            client.execute("SELECT 1")
-            return True
-        except Exception as e:
-            logger.warning("ClickHouse test failed: %s", e)
-            return False
+        @register("sqlite")
+        class SQLiteConnector(BaseConnector): ...
 
-    def list_tables(self) -> list[str]:
-        client = self._client()
-        rows, _ = client.execute("SHOW TABLES", with_column_types=True)
-        return [row[0] for row in rows]
-
-    def extract_batch(
-        self, query: str, batch_size: int = 100, offset: int = 0
-    ) -> tuple[list[dict], int]:
-        try:
-            client = self._client()
-            count_rows, _ = client.execute(
-                f"SELECT COUNT(*) FROM ({query}) AS _q", with_column_types=True
-            )
-            total = count_rows[0][0]
-            paginated = f"{query} LIMIT {batch_size} OFFSET {offset}"
-            rows_raw, col_types = client.execute(paginated, with_column_types=True)
-            col_names = [c[0] for c in col_types]
-            rows = [dict(zip(col_names, row)) for row in rows_raw]
-            return rows, total
-        except Exception as e:
-            raise ConnectorError(f"ClickHouse extract failed: {e}") from e
-
-
-# ── Registry ──────────────────────────────────────────────────────────────
-REGISTRY: dict[str, type[BaseConnector]] = {
-    "postgresql": PostgreSQLConnector,
-    "mysql": MySQLConnector,
-    "mongodb": MongoDBConnector,
-    "clickhouse": ClickHouseConnector,
-}
+        # or
+        register("sqlite", SQLiteConnector)
+    """
+    if not issubclass(connector_cls, BaseConnector):
+        raise TypeError(f"{connector_cls} must subclass BaseConnector")
+    REGISTRY[db_type] = connector_cls
+    logger.debug("Registered connector: %s → %s", db_type, connector_cls.__name__)
+    return connector_cls
 
 
 def get_connector(connection_model) -> BaseConnector:
-    """Factory: get a live connector from a Connection model instance."""
+    """
+    Factory: instantiate the right connector from a Connection model.
+
+    Raises ConnectorNotFound if no connector is registered for the db_type.
+    """
     cls = REGISTRY.get(connection_model.db_type)
     if cls is None:
-        raise ConnectorError(f"Unsupported db_type: {connection_model.db_type}")
+        available = ", ".join(sorted(REGISTRY.keys()))
+        raise ConnectorNotFound(
+            f"No connector registered for db_type '{connection_model.db_type}'. "
+            f"Available: {available}"
+        )
     config = {
-        "host": connection_model.host,
-        "port": connection_model.port,
+        "host":     connection_model.host,
+        "port":     connection_model.port,
         "database": connection_model.database,
         "username": connection_model.username,
         "password": connection_model.password,
         **connection_model.extra_options,
     }
     return cls(config)
+
+
+def list_registered() -> list[dict]:
+    """Return metadata for all registered connectors (for the API/UI)."""
+    return [
+        {"db_type": key, **cls.get_meta()}
+        for key, cls in sorted(REGISTRY.items())
+    ]
+
+
+def _auto_discover_contrib() -> None:
+    """
+    Auto-import every module inside apps/connectors/contrib/ so that
+    contrib connectors self-register via register() at import time.
+    """
+    contrib_dir = Path(__file__).parent / "contrib"
+    if not contrib_dir.exists():
+        return
+    for finder, name, _ in pkgutil.iter_modules([str(contrib_dir)]):
+        module_path = f"apps.connectors.contrib.{name}"
+        try:
+            importlib.import_module(module_path)
+            logger.debug("Auto-discovered contrib connector: %s", module_path)
+        except Exception as exc:
+            logger.warning("Failed to load contrib connector %s: %s", module_path, exc)
+
+
+# ── PostgreSQL ─────────────────────────────────────────────────────────────
+class PostgreSQLConnector(BaseConnector):
+    display_name = "PostgreSQL"
+    default_port = 5432
+
+    def _conn(self):
+        import psycopg2
+        cfg = self.config
+        return psycopg2.connect(
+            host=cfg["host"], port=cfg.get("port", 5432),
+            dbname=cfg["database"], user=cfg["username"],
+            password=cfg.get("password", ""), connect_timeout=10,
+        )
+
+    def test_connection(self) -> bool:
+        try:
+            conn = self._conn(); conn.close(); return True
+        except Exception as e:
+            logger.warning("PG test failed: %s", e); return False
+
+    def list_tables(self) -> list[str]:
+        conn = self._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT table_schema || '.' || table_name
+                    FROM information_schema.tables
+                    WHERE table_schema NOT IN ('pg_catalog','information_schema')
+                    ORDER BY 1
+                """)
+                return [r[0] for r in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def extract_batch(self, query, batch_size=100, offset=0):
+        import psycopg2.extras
+        conn = None
+        try:
+            conn = self._conn()
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                q = query.strip().rstrip(";")
+                cur.execute(f"SELECT COUNT(*) FROM ({q}) AS _q")
+                total = cur.fetchone()["count"]
+                cur.execute(f"{q} LIMIT %s OFFSET %s", (batch_size, offset))
+                return [dict(r) for r in cur.fetchall()], total
+        except Exception as e:
+            raise ConnectorError(f"PostgreSQL extract failed: {e}") from e
+        finally:
+            if conn: conn.close()
+
+
+# ── MySQL ──────────────────────────────────────────────────────────────────
+class MySQLConnector(BaseConnector):
+    display_name = "MySQL"
+    default_port = 3306
+
+    def _conn(self):
+        import MySQLdb
+        cfg = self.config
+        return MySQLdb.connect(
+            host=cfg["host"], port=cfg.get("port", 3306),
+            db=cfg["database"], user=cfg["username"],
+            passwd=cfg.get("password", ""), connect_timeout=10, charset="utf8mb4",
+        )
+
+    def test_connection(self) -> bool:
+        try:
+            conn = self._conn(); conn.close(); return True
+        except Exception as e:
+            logger.warning("MySQL test failed: %s", e); return False
+
+    def list_tables(self) -> list[str]:
+        conn = self._conn()
+        try:
+            cur = conn.cursor()
+            cur.execute("SHOW FULL TABLES WHERE Table_type = 'BASE TABLE'")
+            return [r[0] for r in cur.fetchall()]
+        finally:
+            conn.close()
+
+    def extract_batch(self, query, batch_size=100, offset=0):
+        import MySQLdb.cursors
+        conn = None
+        try:
+            conn = self._conn()
+            cur = conn.cursor(MySQLdb.cursors.DictCursor)
+            q = query.strip().rstrip(";")
+            cur.execute(f"SELECT COUNT(*) AS cnt FROM ({q}) AS _q")
+            total = cur.fetchone()["cnt"]
+            cur.execute(f"{q} LIMIT %s OFFSET %s", (batch_size, offset))
+            return list(cur.fetchall()), total
+        except Exception as e:
+            raise ConnectorError(f"MySQL extract failed: {e}") from e
+        finally:
+            if conn: conn.close()
+
+
+# ── MongoDB ────────────────────────────────────────────────────────────────
+class MongoDBConnector(BaseConnector):
+    display_name = "MongoDB"
+    default_port = 27017
+
+    def _client(self):
+        from pymongo import MongoClient
+        cfg = self.config
+        uri = (f"mongodb://{cfg['username']}:{cfg['password']}"
+               f"@{cfg['host']}:{cfg.get('port', 27017)}"
+               f"/{cfg['database']}?authSource=admin")
+        return MongoClient(uri, serverSelectionTimeoutMS=5000)
+
+    def test_connection(self) -> bool:
+        try:
+            c = self._client(); c.server_info(); c.close(); return True
+        except Exception as e:
+            logger.warning("Mongo test failed: %s", e); return False
+
+    def list_tables(self) -> list[str]:
+        c = self._client()
+        try:
+            return c[self.config["database"]].list_collection_names()
+        finally:
+            c.close()
+
+    def extract_batch(self, query, batch_size=100, offset=0):
+        import json
+        client = None
+        try:
+            client = self._client()
+            db = client[self.config["database"]]
+            try:
+                params = json.loads(query)
+                col_name = params.get("collection", query)
+                filter_doc = params.get("filter", {})
+            except (json.JSONDecodeError, TypeError):
+                col_name, filter_doc = query.strip(), {}
+            col = db[col_name]
+            total = col.count_documents(filter_doc)
+            rows = list(col.find(filter_doc, {"_id": 0}).skip(offset).limit(batch_size))
+            return rows, total
+        except Exception as e:
+            raise ConnectorError(f"MongoDB extract failed: {e}") from e
+        finally:
+            if client: client.close()
+
+
+# ── ClickHouse ─────────────────────────────────────────────────────────────
+class ClickHouseConnector(BaseConnector):
+    display_name = "ClickHouse"
+    default_port = 9000
+
+    def _client(self, db=None):
+        from clickhouse_driver import Client
+        cfg = self.config
+        return Client(
+            host=cfg["host"], port=cfg.get("port", 9000),
+            database=db or cfg["database"],
+            user=cfg["username"], password=cfg.get("password", ""),
+            connect_timeout=10,
+        )
+
+    def _ensure_db(self):
+        c = self._client(db="default")
+        c.execute(f"CREATE DATABASE IF NOT EXISTS {self.config['database']}")
+
+    def test_connection(self) -> bool:
+        try:
+            self._ensure_db()
+            self._client().execute("SELECT 1")
+            return True
+        except Exception as e:
+            logger.warning("ClickHouse test failed: %s", e); return False
+
+    def list_tables(self) -> list[str]:
+        self._ensure_db()
+        rows, _ = self._client().execute("SHOW TABLES", with_column_types=True)
+        return [r[0] for r in rows]
+
+    def extract_batch(self, query, batch_size=100, offset=0):
+        try:
+            self._ensure_db()
+            client = self._client()
+            q = query.strip().rstrip(";")
+            count_rows, _ = client.execute(
+                f"SELECT COUNT(*) FROM ({q}) AS _q", with_column_types=True
+            )
+            total = count_rows[0][0]
+            rows_raw, col_types = client.execute(
+                f"{q} LIMIT {batch_size} OFFSET {offset}", with_column_types=True
+            )
+            cols = [c[0] for c in col_types]
+            return [dict(zip(cols, r)) for r in rows_raw], total
+        except Exception as e:
+            raise ConnectorError(f"ClickHouse extract failed: {e}") from e
+
+
+# ── Register built-in connectors ────────────────────────────────────────────
+register("postgresql", PostgreSQLConnector)
+register("mysql",      MySQLConnector)
+register("mongodb",    MongoDBConnector)
+register("clickhouse", ClickHouseConnector)
+
+# ── Auto-discover contrib connectors ────────────────────────────────────────
+_auto_discover_contrib()

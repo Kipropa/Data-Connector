@@ -55,7 +55,7 @@ class TestRegistry:
 
     def test_get_connector_unknown_type_raises(self):
         model = make_connection_model(db_type="oracle")
-        with pytest.raises(ConnectorError, match="Unsupported db_type"):
+        with pytest.raises(ConnectorError, match="No connector registered"):
             get_connector(model)
 
 
@@ -164,6 +164,7 @@ class TestClickHouseConnector:
         c = ClickHouseConnector(make_config())
         mock_client = MagicMock()
         mock_client.execute.side_effect = [
+            None,                                # CREATE DATABASE query
             ([[10]], [("count()", "UInt64")]),   # count query
             ([[1, "api_latency", 42.5]], [("id", "UInt64"), ("name", "String"), ("val", "Float64")]),
         ]

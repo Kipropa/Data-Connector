@@ -49,3 +49,5 @@ htmlcov/
 
 # Misc
 *.pid
+.vs/
+test_results.txt
