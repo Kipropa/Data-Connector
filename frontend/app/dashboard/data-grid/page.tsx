@@ -86,6 +86,14 @@ export default function DataGridPage() {
 
   function commitEdit(record: any) {
     if (!editingCell) return;
+
+    // Basic Validation: Prevent empty values
+    if (!editValue.trim()) {
+      toast.error("Validation Error: Cell value cannot be empty");
+      setEditingCell(null);
+      return;
+    }
+
     const updatedData = { ...(record.effective_data ?? record.data ?? {}), [editingCell.field]: editValue };
     patchMut.mutate({ id: record.id, data: updatedData });
     setEditingCell(null);

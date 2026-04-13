@@ -1,32 +1,89 @@
-# Design Decisions
+# Architecture & Design Decisions
 
-## 1. Why Django REST Framework?
-DRF offers the fastest path from a Python data model to a robust, documented API. Its `ModelSerializer` + `ViewSet` pattern eliminates boilerplate while staying explicit about what's exposed. `drf-spectacular` gives us OpenAPI 3.0 for free, which is critical when multiple DB drivers are involved and the frontend team needs a contract.
-**Alternatives considered:** FastAPI is faster and more modern but lacks the admin UI, ORM, and batteries-included auth that DRF provides — important for a data-management tool that might need manual admin interventions.
+I made these choices with a clear goal in mind: build a **reliable, maintainable, and user-friendly** data management platform that works smoothly across different database types while keeping development fast and the user experience smooth.
+
+## 1. Why Django REST Framework (DRF) for the Backend?
+
+DRF was the best choice because it gives us the **fastest and cleanest path** from Python data models to a production-ready, well-documented API.
+
+Its `ModelSerializer` + `ViewSet` pattern removes a lot of repetitive code while still keeping everything explicit and clear about what data is exposed to the frontend.
+
+### Key Benefits:
+- **Excellent Documentation**: With `drf-spectacular`, I get a clean OpenAPI 3.0 schema automatically. This is essential when working with multiple database types and maintaining a strict contract with the frontend team.
+- **Built-in Admin Panel**: I instantly get the powerful Django Admin interface to view and manage Connections, Files, Users, and other models — saving us tons of time during development and support.
+
+**Alternative considered**: FastAPI  
+While FastAPI is faster and more modern, it doesn’t offer a native ORM, built-in admin UI, or out-of-the-box authentication like DRF does. These features are critical for a data platform that needs strong administrative oversight.
 
 ## 2. Why the Connector Abstraction Layer?
-Rather than littering the codebase with `if db_type == "postgresql": ...` branches, every database implements `BaseConnector`. The `REGISTRY` dict is the only place that knows about concrete types. This means:
-- Adding a new database = one new file + one REGISTRY entry
-- Testing a connector = mock its `_conn()` method, no framework required
-- The batch extraction and test endpoints are database-agnostic
-**Alternative considered:** SQLAlchemy as a unified connector. Rejected because it doesn't support MongoDB or ClickHouse natively, and the abstraction layer approach is simpler and more transparent.
+
+Instead of filling the code with messy conditionals like `if db_type == "postgresql": ...`, I created a clean **abstraction layer**.
+
+Every database driver implements a `BaseConnector` abstract class. A simple `REGISTRY` dictionary is the only place that knows about the actual implementations.
+
+### Advantages:
+- Adding support for a new database only requires one new file and one line in the registry.
+- Batch extraction and test endpoints stay completely database-agnostic.
+- Each connector can be tested in isolation by simply mocking its connection method.
+
+**Alternative considered**: SQLAlchemy  
+I rejected it because it doesn’t handle NoSQL (MongoDB) or OLAP databases (ClickHouse) cleanly out of the box. Our custom abstraction layer (`engine.py`) gives us equal flexibility across SQL, NoSQL, and columnar databases.
 
 ## 3. Why Celery for Batch Jobs?
-Batch extraction over large tables can take seconds to minutes. Running it inside a Django view would block the request thread, hit Gunicorn timeouts, and give the user no feedback. Celery decouples extraction from the HTTP layer, lets us report progress, and lets us retry on transient failures.
-**Alternative considered:** Django async views with asyncio. Rejected because the DB drivers (psycopg2, MySQLdb, clickhouse-driver) are all synchronous, and mixing sync drivers with async Django creates complexity without benefit.
 
-## 4. Why Dual Storage (DB + File)?
-The DB record (`DataRecord`) provides queryable, relational storage — useful for audits, re-processing, and incremental updates. The file (JSON/CSV) provides a portable, human-readable snapshot at a point in time that external tools can consume without database access. Both are created in a single transaction in `submit_edited_records()` so they're always consistent.
+Extracting data from large tables can take seconds or even minutes. I couldn’t afford to block the user’s browser while waiting.
 
-## 5. Why Next.js App Router?
-The App Router's server components coexist with client-side interactivity. The data-heavy pages (grid, jobs table) benefit from client-side fetching (TanStack Query with polling), while simpler pages could be server-rendered. The layout nesting (`dashboard/layout.tsx`) cleanly separates auth-guarded content from public routes.
-**Alternatives considered:** Vite + React SPA. Rejected because Next.js gives us file-based routing, built-in rewrites for the API proxy, and better production deployment options — for no extra complexity in development.
+### Why Celery?
+- **Asynchronous Processing**: Keeps HTTP requests fast and prevents Gunicorn/Nginx timeouts.
+- **Better User Experience**: Users can see progress updates and the UI remains responsive.
+- **Resiliency**: Easy to retry failed jobs (e.g., temporary database issues) without affecting the frontend.
 
-## 6. Why Zustand over Redux?
-The application state is simple: auth token + user object + theme preference. Redux adds ~400 lines of boilerplate for this. Zustand gives us typed stores in 20 lines with the `persist` middleware handling localStorage serialization.
+**Alternative considered**: Django async views with `asyncio`  
+I rejected this because most of our database drivers (`psycopg2`, `MySQLdb`, `clickhouse-driver`) are synchronous. Mixing them with async code would add unnecessary complexity with very little gain.
 
-## 7. Why TanStack Query over SWR?
-TanStack Query's `useMutation` with `onSuccess` cache invalidation makes the CRUD flows clean. SWR requires manual cache writes for mutations. Query also has better TypeScript generics and devtools.
+## 4. Why Dual Storage (Database + Local File System)?
+
+When data is extracted, I store it in **two complementary formats**:
+
+- **Database Record (`DataRecord`)**: Keeps everything queryable, linked to users and connections. Perfect for auditing, job history, and future re-processing.
+- **File Dump (JSON/CSV)**: Provides a portable, human-readable snapshot that users or external tools can download and use without needing access to the database.
+
+Both are saved together inside a single database transaction (`submit_edited_records()`) to guarantee they always stay perfectly in sync.
+
+## 5. Why Next.js (App Router) for the Frontend?
+
+Next.js with the App Router strikes the perfect balance between performance and developer experience.
+
+### Main Reasons:
+- **Hybrid Rendering**: Heavy interactive pages (Data Grid, Jobs table) use client-side fetching and polling, while static parts are server-rendered for speed.
+- **Nested Layouts**: The file-based routing system makes it very intuitive to separate public pages from authenticated dashboard sections.
+
+**Alternative considered**: Vite + React SPA  
+I chose Next.js because it offers better production deployment options, built-in API proxying (no more annoying CORS issues in development), and overall simpler configuration.
+
+## 6. Why Zustand over Redux for State Management?
+
+Our global state needs are quite simple — I mainly manage Auth Tokens, the current User object, and Light/Dark theme preference.
+
+### Why Zustand?
+- **Minimal Boilerplate**: Redux would have added roughly 400 extra lines of actions, reducers, and thunks.
+- **Simplicity & Speed**: I can create a fully typed global store in about 20 lines of code.
+- **Persistence**: Works beautifully with the `persist` middleware for automatic `localStorage` sync.
+
+## 7. Why TanStack Query (React Query) over SWR?
+
+I needed robust, production-grade data fetching for our Data Grid, Analytics, and general API calls.
+
+### Why TanStack Query?
+- **Better Mutation Handling**: `useMutation()` + automatic cache invalidation makes CRUD operations much smoother than SWR.
+- **Superior TypeScript Support**: Excellent generics inference and very powerful DevTools that speed up development and debugging.
 
 ## 8. File Storage Security and Access Protocol
-Admins are given sweeping access across files and connections, whereas users maintain ownership-based privileges (e.g. view only files they created or that have been directly shared with them). This ensures data exports remain segmented per the requirements. A bespoke `FileShare` model enforces sharing workflows.
+
+I follow a clear **ownership + role-based access control (RBAC)** model:
+
+- **Superusers**: Have full visibility across the entire system to prevent orphaned jobs, files, or queries.
+- **Regular Users**: Are sandboxed — they can only access connections and files they created themselves.
+- **Sharing**: A dedicated `FileShare` model enables safe and controlled collaboration between users.
+
+This design ensures both security and usability across the platform.
