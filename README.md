@@ -265,27 +265,3 @@ In the `Connection` model, passwords are stored as plain text for development si
 | NEXT_PUBLIC_API_URL   | http://localhost:8000/api      | Django API base |
 
 ---
-
-## Walkthrough Transcript
-
-**0:00** — App loads at `localhost:3000`, redirects to `/login`. Enter `admin@dataconnect.io` / `admin1234`. JWT is issued and stored in localStorage.
-
-**0:20** — Dashboard shows 4 stat cards (connections, records, jobs, files). All zero on fresh install.
-
-**0:35** — Navigate to **Connections**. Click "New Connection". Fill in the PostgreSQL details for the sample DB (`host: postgres`, `port: 5432`, `db: dataconnect`, `user: dc_user`, `pass: dc_pass`). Save. Card appears with "untested" badge.
-
-**1:00** — Click **Test** on the new connection. Badge turns green "● connected". Click **Tables** — a modal lists `sample.users`, `sample.orders`.
-
-**1:20** — Navigate to **Batch Jobs**. Click "New Batch Job". Select the connection, enter `SELECT * FROM sample.users`, batch size 8. Click "Run Batch Job". Job appears with "pending" → "running" → "done" (auto-polls every 5s).
-
-**1:50** — Click **View** button on the completed job. Navigates to **Data Grid** with the job pre-selected. 8 rows displayed with columns: id, email, name, status, region, created_at.
-
-**2:10** — Double-click the `status` cell for row 2. It turns orange/editable. Type "verified". Press Enter. Cell shows "edited" badge.
-
-**2:25** — Select rows 1, 2, 3 with checkboxes. Click "Submit & Save JSON". Toast: "Submitted 3 rows — file saved!". Rows get "submitted" badge.
-
-**2:40** — Navigate to **File Storage**. A new file `export_1_20240114_100000.json` is listed. Click **Download** — browser downloads the JSON file containing metadata + the 3 rows.
-
-**3:00** — Navigate to **Users & Roles**. RBAC info card shows Admin vs User permissions matrix. Users table shows the admin account.
-
-**3:15** — Log out. Sign in as a regular user (create via Django admin or register endpoint). Data Grid shows only that user's jobs. File Storage shows only their files.
